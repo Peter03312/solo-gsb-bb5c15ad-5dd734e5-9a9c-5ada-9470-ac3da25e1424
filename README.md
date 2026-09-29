@@ -673,13 +673,14 @@ curl 'http://localhost:8000/snapshots/c5495f87-9b83-41b0-9d5c-1070ba771cdf/merkl
 - 空快照（`watermark=0`）根响应 `leaf_count=0, empty=true, root=b86d2a82…`（固定值）；对空快照带 `seq` 返回 404 `seq_out_of_snapshot`。
 - 错误：快照不存在 404 `snapshot_not_found`；`seq` 不是该快照 `1..watermark` 内序号返回 404 `seq_out_of_snapshot`；`seq=0`、负数、非整数返回 422。
 
-**离线验真（跨语言）**：无需本服务，任何语言按三步复算——① 用规范序列化负载重算叶哈希；② 按路径从叶向上折到根（方向 / 复制位由 `leaf_index` 与叶子数重新推导，不信任证明自报值）；③ 与公布的根逐字节比较。Python 参考实现（仅标准库）：
+**离线验真（跨语言）**：无需本服务，任何语言按三步复算——① 用规范序列化负载重算叶哈希；② 按路径从叶向上折到根（方向 / 复制位由 `leaf_index` 与叶子数重新推导，不信任证明自报值）；③ 与公布的根逐字节比较。任何形状错误（摘要不是 64 位小写十六进制、路径步骤不是对象或缺 / 多字段、路径缺步或多步）一律按**无效证明（false）**处理，不应让解析异常逃出验签函数。Python 参考实现（仅标准库）：
 
 ```python
-import hashlib, json
+import hashlib, json, re
 
 LEAF_PREFIX = b"snapshot-merkle:v1:leaf:"
 NODE_PREFIX = b"snapshot-merkle:v1:node:"
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 
 def canon(obj) -> bytes:  # 规范序列化：紧凑、不转义非 ASCII（与服务端字节一致）
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -691,22 +692,42 @@ def h_node(left, right):
     return hashlib.sha256(NODE_PREFIX + left + right).digest()
 
 def verify(entry, leaf_index, leaf_count, path, expected_root_hex):
-    cur = h_leaf(entry)
-    width, idx = leaf_count, leaf_index
-    for step in path:                       # side / duplicated 由形状重新推导
-        if width == 1:
-            return False                    # 已到根，路径不应再给出兄弟
-        dup = idx % 2 == 0 and idx + 1 >= width
-        expect_side = "right" if idx % 2 == 0 else "left"
-        if step["duplicated"] != dup or step["side"] != expect_side:
-            return False
-        raw_sib = bytes.fromhex(step["hash"])
-        if dup and raw_sib != cur:
-            return False
-        sib = cur if dup else raw_sib
-        cur = h_node(cur, sib) if idx % 2 == 0 else h_node(sib, cur)
-        width, idx = (width + 1) // 2, idx // 2
-    return width == 1 and idx == 0 and cur.hex() == expected_root_hex
+    # 形状 / 类型先行：结构错误一律返回 False，不向调用方泄漏解析异常
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        return False
+    if not isinstance(leaf_index, int) or isinstance(leaf_index, bool):
+        return False
+    if leaf_count < 1 or not 0 <= leaf_index < leaf_count:
+        return False
+    if not isinstance(path, list) or not _DIGEST_RE.fullmatch(expected_root_hex):
+        return False
+    try:
+        cur = h_leaf(entry)
+        width, idx = leaf_count, leaf_index
+        for level, step in enumerate(path):       # side / duplicated 由形状重新推导
+            if width == 1:
+                return False                      # 已到根，路径不应再给出兄弟（多步）
+            if not isinstance(step, dict) or set(step) != {"level", "side", "hash", "duplicated"}:
+                return False
+            if not isinstance(step["level"], int) or step["level"] != level:
+                return False
+            if not isinstance(step["duplicated"], bool):
+                return False
+            if not _DIGEST_RE.fullmatch(step["hash"]):
+                return False
+            dup = idx % 2 == 0 and idx + 1 >= width
+            expect_side = "right" if idx % 2 == 0 else "left"
+            if step["duplicated"] != dup or step["side"] != expect_side:
+                return False
+            raw_sib = bytes.fromhex(step["hash"])  # 已预校验，不会抛异常
+            if dup and raw_sib != cur:
+                return False
+            sib = cur if dup else raw_sib
+            cur = h_node(cur, sib) if idx % 2 == 0 else h_node(sib, cur)
+            width, idx = (width + 1) // 2, idx // 2
+        return width == 1 and idx == 0 and cur.hex() == expected_root_hex
+    except (TypeError, ValueError):
+        return False                             # 兜底：结构异常等价于无效证明
 ```
 
 Node.js（`JSON.stringify` 默认紧凑且不转义非 ASCII，符合本方案；叶子数为 1 时路径为空、根即叶哈希）：

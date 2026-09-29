@@ -558,6 +558,150 @@ def test_builtin_strict_verifier_agrees_with_reference(client):
             assert bad is False
 
 
+def test_builtin_verifier_never_raises_on_malformed_inputs():
+    """任何结构错误都必须返回 False（而非抛出解析异常），调用方按无效证明处理。"""
+    # 合成 5 叶树的合法证明（叶 / 兄弟均为 64 位十六进制即可）
+    leaves = [f"{i:064x}" for i in range(1, 6)]
+    root = app_merkle.merkle_root(leaves)
+    path = app_merkle.inclusion_proof(leaves, 0)
+    good = dict(
+        leaf_hash=leaves[0], index=0, leaf_count=5, path=path, root_hex=root
+    )
+    assert app_merkle.verify_inclusion_proof(**good) is True
+
+    def rejects(**overrides):
+        kwargs = {**good, **overrides}
+        # 不允许任何异常泄漏；结论必须明确为 False
+        assert app_merkle.verify_inclusion_proof(**kwargs) is False
+
+    # ---- 摘要格式错误（叶子 / 根 / 兄弟） ----
+    rejects(leaf_hash="zz" + "a" * 62)   # 非十六进制字符
+    rejects(leaf_hash="A" * 64)         # 大写不接受
+    rejects(leaf_hash="a" * 63)         # 少一位（奇长度 fromhex 本会抛错）
+    rejects(leaf_hash="a" * 65)         # 多一位
+    rejects(leaf_hash="")
+    rejects(leaf_hash=None)
+    rejects(leaf_hash=123)
+    rejects(leaf_hash=b"a" * 64)
+    rejects(root_hex="not-hex")
+    rejects(root_hex="a" * 63)
+    rejects(root_hex="A" * 64)
+
+    bad = [dict(s) for s in path]
+    bad[0]["hash"] = "g" * 64           # 兄弟含非十六进制字符
+    rejects(path=bad)
+    bad = [dict(s) for s in path]
+    bad[0]["hash"] = bad[0]["hash"][:-1]  # 兄弟奇长度
+    rejects(path=bad)
+    bad = [dict(s) for s in path]
+    bad[0]["hash"] = bad[0]["hash"][:-1] + "A"  # 兄弟含大写十六进制字符
+    rejects(path=bad)
+    bad = [dict(s) for s in path]
+    bad[0]["hash"] = None
+    rejects(path=bad)
+
+    # ---- 路径步骤结构错误（非对象） ----
+    rejects(path=[None])
+    rejects(path=["right:" + leaves[1]])
+    rejects(path=[42])
+    rejects(path=[[leaves[1]]])
+
+    # ---- 步骤缺键 / 多键 / 字段类型或取值错误 ----
+    bad = [dict(s) for s in path]
+    del bad[0]["side"]
+    rejects(path=bad)
+    bad = [dict(s) for s in path]
+    del bad[0]["hash"]
+    rejects(path=bad)
+    bad = [dict(s) for s in path]
+    bad[0]["extra"] = 1                 # 多余键
+    rejects(path=bad)
+    bad = [dict(s) for s in path]
+    bad[0]["side"] = "up"
+    rejects(path=bad)
+    bad = [dict(s) for s in path]
+    bad[0]["side"] = 1
+    rejects(path=bad)
+    bad = [dict(s) for s in path]
+    bad[0]["duplicated"] = "false"      # 非 bool（bool("false") 本会误当真值）
+    rejects(path=bad)
+    bad = [dict(s) for s in path]
+    bad[0]["duplicated"] = None
+    rejects(path=bad)
+    bad = [dict(s) for s in path]
+    bad[0]["level"] = "0"
+    rejects(path=bad)
+    bad = [dict(s) for s in path]
+    bad[0]["level"] = 1                 # 层号必须从 0 起连续
+    rejects(path=bad)
+
+    # ---- 路径缺步 / 多步 ----
+    rejects(path=path[:-1])             # 缺步：未折到根层
+    rejects(path=path + [dict(path[-1])])  # 多步：已到根仍给兄弟
+
+    # 单叶树合法证明为空路径；多给任何一步即无效
+    single = f"{1:064x}"
+    assert (
+        app_merkle.verify_inclusion_proof(
+            leaf_hash=single,
+            index=0,
+            leaf_count=1,
+            path=[],
+            root_hex=single,
+        )
+        is True
+    )
+    assert app_merkle.verify_inclusion_proof(
+        leaf_hash=single,
+        index=0,
+        leaf_count=1,
+        path=[{"level": 0, "side": "right", "hash": single, "duplicated": True}],
+        root_hex=single,
+    ) is False
+
+    # ---- index / leaf_count 非整数、越界（bool 是 int 子类也要拒） ----
+    rejects(index="0")
+    rejects(index=None)
+    rejects(index=True)
+    rejects(index=5)
+    rejects(index=-1)
+    rejects(leaf_count="5")
+    rejects(leaf_count=None)
+    rejects(leaf_count=True)
+    rejects(leaf_count=0)
+
+    # ---- path 非列表（None / tuple / dict 都不能触发迭代异常） ----
+    rejects(path=None)
+    rejects(path=tuple(path))
+    rejects(
+        path={
+            "level": 0,
+            "side": "right",
+            "hash": leaves[1],
+            "duplicated": False,
+        }
+    )
+
+
+def test_builtin_verifier_accepts_valid_proofs_for_all_tree_shapes_1_to_8():
+    """合法证明在 1..8 叶各种树形（含多层奇数复制）下仍严格验至根。"""
+    for n in range(1, 9):
+        leaves = [
+            hashlib.sha256(f"leaf-{i}".encode()).hexdigest() for i in range(n)
+        ]
+        root = app_merkle.merkle_root(leaves)
+        for index in range(n):
+            path = app_merkle.inclusion_proof(leaves, index)
+            assert app_merkle.verify_inclusion_proof(
+                leaf_hash=leaves[index],
+                index=index,
+                leaf_count=n,
+                path=path,
+                root_hex=root,
+            ) is True
+
+
+
 # ---------- 冻结性：快照后变化不改变旧根 ----------
 
 

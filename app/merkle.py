@@ -38,6 +38,7 @@
 """
 
 import hashlib
+import re
 
 #: 方案版本标识，随响应返回，供下游区分算法版本
 SCHEME = "snapshot-merkle:v1"
@@ -54,6 +55,17 @@ EMPTY_ROOT = hashlib.sha256(b"snapshot-merkle:v1:empty").hexdigest()
 #: 摘要算法与编码（随响应返回，便于离线工具断言）
 HASH_ALGORITHM = "SHA-256"
 HASH_ENCODING = "hex"
+
+#: 合法摘要：SHA-256 的 32 字节，以**小写**十六进制表示（恰好 64 位）
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+#: 包含证明单步允许（且必填）的固定键集
+_PROOF_STEP_KEYS = frozenset(("level", "side", "hash", "duplicated"))
+
+
+def _is_digest(value) -> bool:
+    """value 是否为 64 位小写十六进制摘要字符串（不抛异常，只返回布尔）。"""
+    return isinstance(value, str) and _DIGEST_RE.fullmatch(value) is not None
 
 #: 叶子负载的固定键序（字幕 / 缺口共用同一 9 键集，缺失值用 null）
 LEAF_KEYS = (
@@ -237,20 +249,52 @@ def verify_inclusion_proof(
     供离线验真参考实现——不信任路径自报的 side / duplicated，只信兄弟
     摘要；任何一步不一致或最终摘要不等于树根都返回 False。单叶树
     （leaf_count=1）的路径为空，树根应恰为叶子摘要。
+
+    对**任何**结构错误的无效输入（摘要非 64 位小写十六进制、path 非
+    列表、步骤非对象 / 键集不符 / 字段类型错误、index / leaf_count 非
+    整数或越界、路径缺步或多步）一律返回 False，绝不抛出解析异常，
+    调用方只需按布尔结论处理。
     """
+    # 形状 / 类型先行：bool 是 int 子类，需显式排除；后续不调用任何可能
+    # 抛异常的解析（bytes.fromhex 等），摘要统一用正则预校验。
+    if (
+        not isinstance(leaf_count, int)
+        or isinstance(leaf_count, bool)
+        or not isinstance(index, int)
+        or isinstance(index, bool)
+    ):
+        return False
     if leaf_count < 1 or not 0 <= index < leaf_count:
+        return False
+    if not isinstance(path, list):
+        return False
+    if not _is_digest(leaf_hash) or not _is_digest(root_hex):
         return False
     level_len = leaf_count
     idx = index
     current = leaf_hash
-    for step in path:
+    for level, step in enumerate(path):
         if level_len == 1:
-            # 已经到达唯一的根节点，路径不应再给出兄弟
+            # 已经到达唯一的根节点，路径不应再给出兄弟（多步）
             return False
-        side = step.get("side")
-        sibling = step.get("hash")
-        duplicated = bool(step.get("duplicated"))
-        if not isinstance(sibling, str):
+        if not isinstance(step, dict):
+            return False
+        if set(step) != _PROOF_STEP_KEYS:
+            return False
+        step_level = step["level"]
+        side = step["side"]
+        sibling = step["hash"]
+        duplicated = step["duplicated"]
+        # 层号必须从 0 起自叶向根连续递增
+        if not isinstance(step_level, int) or isinstance(step_level, bool):
+            return False
+        if step_level != level:
+            return False
+        if not isinstance(side, str) or side not in ("left", "right"):
+            return False
+        if not isinstance(duplicated, bool):
+            return False
+        if not _is_digest(sibling):
             return False
         # 复制只可能发生在：index 为偶数、且它就是本层最后一个节点
         expect_duplicated = idx % 2 == 0 and idx + 1 >= level_len
