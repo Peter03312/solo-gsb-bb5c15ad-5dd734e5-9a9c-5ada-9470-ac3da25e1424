@@ -38,6 +38,10 @@
 """
 
 import hashlib
+import re
+
+#: 严格的 SHA-256 小写十六进制摘要形态（恰好 64 个十六进制字符）
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}\Z")
 
 #: 方案版本标识，随响应返回，供下游区分算法版本
 SCHEME = "snapshot-merkle:v1"
@@ -224,6 +228,15 @@ def inclusion_proof(leaf_hashes: list, index: int) -> list:
     return path
 
 
+def _is_digest(value) -> bool:
+    """严格判定 value 是否为 32 字节摘要的小写十六进制串（恰好 64 hex）。
+
+    大写十六进制视为非法：本方案所有摘要输出均为小写，验签应逐字符
+    （而非大小写折叠后）比较。
+    """
+    return isinstance(value, str) and _DIGEST_RE.fullmatch(value) is not None
+
+
 def verify_inclusion_proof(
     *,
     leaf_hash: str,
@@ -237,21 +250,73 @@ def verify_inclusion_proof(
     供离线验真参考实现——不信任路径自报的 side / duplicated，只信兄弟
     摘要；任何一步不一致或最终摘要不等于树根都返回 False。单叶树
     （leaf_count=1）的路径为空，树根应恰为叶子摘要。
+
+    对**任何结构 / 格式错误的无效输入**（非法十六进制摘要、非对象的路径
+    步骤、路径缺步或多步、index / leaf_count 非整数或越界等）一律返回
+    False，绝不向调用方抛出解析异常——调用方只需按“证明无效”处理。
     """
+    try:
+        return _verify_inclusion_proof(
+            leaf_hash=leaf_hash,
+            index=index,
+            leaf_count=leaf_count,
+            path=path,
+            root_hex=root_hex,
+        )
+    except (TypeError, ValueError):
+        # 防御性兜底：上面的结构检查已覆盖所有已知畸形输入；即使残留
+        # 解析错误也视为证明无效，而非把异常泄漏给调用方。
+        return False
+
+
+def _verify_inclusion_proof(
+    *,
+    leaf_hash: str,
+    index: int,
+    leaf_count: int,
+    path: list,
+    root_hex: str,
+) -> bool:
+    """verify_inclusion_proof 的实现体；畸形输入返回 False。"""
+    # 整数参数必须是真正的 int（bool 是 int 子类，显式拒绝）
+    if (
+        not isinstance(index, int)
+        or isinstance(index, bool)
+        or not isinstance(leaf_count, int)
+        or isinstance(leaf_count, bool)
+    ):
+        return False
     if leaf_count < 1 or not 0 <= index < leaf_count:
         return False
+    if not isinstance(path, list):
+        return False
+    # 叶子摘要与待验根都必须是严格形态的 32 字节小写十六进制摘要；
+    # 先于折叠校验，使单叶树（路径为空）也无法用畸形摘要蒙混通过
+    if not _is_digest(leaf_hash) or not _is_digest(root_hex):
+        return False
+
     level_len = leaf_count
     idx = index
     current = leaf_hash
-    for step in path:
+    for step_number, step in enumerate(path):
         if level_len == 1:
-            # 已经到达唯一的根节点，路径不应再给出兄弟
+            # 已经到达唯一的根节点，路径不应再给出兄弟（多步）
             return False
-        side = step.get("side")
-        sibling = step.get("hash")
-        duplicated = bool(step.get("duplicated"))
-        if not isinstance(sibling, str):
+        # 每步必须是恰好 4 键的对象，且字段类型 / 层号正确
+        if (
+            not isinstance(step, dict)
+            or set(step) != {"level", "side", "hash", "duplicated"}
+            or not isinstance(step["level"], int)
+            or isinstance(step["level"], bool)
+            or step["level"] != step_number
+            or not isinstance(step["side"], str)
+            or not isinstance(step["duplicated"], bool)
+            or not _is_digest(step["hash"])
+        ):
             return False
+        side = step["side"]
+        sibling = step["hash"]
+        duplicated = step["duplicated"]
         # 复制只可能发生在：index 为偶数、且它就是本层最后一个节点
         expect_duplicated = idx % 2 == 0 and idx + 1 >= level_len
         if duplicated != expect_duplicated:
@@ -272,4 +337,5 @@ def verify_inclusion_proof(
         current = hash_node(left, right)
         level_len = (level_len + 1) // 2
         idx //= 2
+    # 路径缺步会停在非根层（level_len != 1）或停在非 0 下标
     return level_len == 1 and idx == 0 and current == root_hex

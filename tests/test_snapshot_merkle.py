@@ -558,6 +558,88 @@ def test_builtin_strict_verifier_agrees_with_reference(client):
             assert bad is False
 
 
+def test_builtin_verifier_rejects_malformed_inputs_without_raising(client):
+    """畸形输入一律返回 False，绝不向调用方泄漏解析异常。
+
+    覆盖：非法十六进制摘要（叶 / 兄弟 / 根，含大写、错长）、非对象路径
+    步骤、步骤缺键 / 多键 / 层号错 / 字段类型错、路径缺步或多步、path
+    非列表、index / leaf_count 非整数（含 bool）或越界。
+    """
+    snap = build_mixed(client)  # 5 叶：seq1(index0) 路径 2 步
+    sid = snap["snapshot_id"]
+    root = merkle_root(client, sid).json()["root"]
+    p = merkle_root(client, sid, params={"seq": 1}).json()
+    path = p["proof"]["path"]
+    base = dict(
+        leaf_hash=p["leaf_hash"], index=0, leaf_count=5, path=path, root_hex=root
+    )
+
+    step = dict(path[0])
+    malformed_steps = [
+        "not-an-object",
+        None,
+        42,
+        {"side": "right", "hash": step["hash"], "duplicated": False},  # 缺 level
+        {**step, "extra": 1},  # 多键
+        {**step, "level": 1},  # 层号与步序不符
+        {**step, "level": "0"},  # level 非整数
+        {**step, "level": True},  # bool 不算整数
+        {**step, "duplicated": 0},  # duplicated 非布尔
+        {**step, "duplicated": "false"},
+        {**step, "side": 0},  # side 非字符串
+        {**step, "hash": "z" * 64},  # 非法十六进制
+        {**step, "hash": "A" * 64},  # 大写十六进制非法
+        {**step, "hash": "a" * 63},  # 长度不足
+        {**step, "hash": step["hash"] + "a"},  # 长度超出
+        {**step, "hash": None},
+    ]
+    malformed_paths = [[s] for s in malformed_steps] + [
+        None,  # path 不是列表
+        (),  # 元组也不接受（API 契约路径为列表）
+        path[:-1],  # 缺步：折叠后停在非根层
+        [],  # 多叶树空路径：缺步
+        path + [dict(path[-1])],  # 多步：到根后仍给出兄弟
+    ]
+
+    def check(**overrides):
+        kw = dict(base)
+        kw.update(overrides)
+        result = app_merkle.verify_inclusion_proof(**kw)
+        assert result is False, overrides
+
+    for bad_path in malformed_paths:
+        check(path=bad_path)
+
+    for bad_leaf in (None, 64 * "z", 63 * "a", 64 * "A", 65 * "a", b"a" * 64):
+        check(leaf_hash=bad_leaf)
+    for bad_root in (None, 64 * "z", 63 * "a", 64 * "A", 65 * "a", b"0" * 64):
+        check(root_hex=bad_root)
+
+    for bad_index in (None, "0", 0.0, 1.0, False, True, -1, 5, 100):
+        check(index=bad_index)
+    for bad_count in (None, "5", 5.0, False, True, 0, -1):
+        check(leaf_count=bad_count)
+
+    # 合法证明本身仍必须通过，且末叶复制位证明同样可验
+    assert app_merkle.verify_inclusion_proof(**base) is True
+    p5 = merkle_root(client, sid, params={"seq": 5}).json()
+    assert p5["proof"]["path"][0]["duplicated"] is True
+    assert app_merkle.verify_inclusion_proof(
+        leaf_hash=p5["leaf_hash"],
+        index=4,
+        leaf_count=5,
+        path=p5["proof"]["path"],
+        root_hex=root,
+    ) is True
+    # 复制步的兄弟摘要必须等于当前节点；不相等即失败（且不抛异常）
+    bad_dup = [dict(s) for s in p5["proof"]["path"]]
+    bad_dup[0]["hash"] = "0" * 64
+    assert not app_merkle.verify_inclusion_proof(
+        leaf_hash=p5["leaf_hash"], index=4, leaf_count=5,
+        path=bad_dup, root_hex=root,
+    )
+
+
 # ---------- 冻结性：快照后变化不改变旧根 ----------
 
 
